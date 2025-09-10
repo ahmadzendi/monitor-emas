@@ -1,11 +1,9 @@
 import asyncio
 import json
-import threading
 from datetime import datetime, timedelta
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from contextlib import asynccontextmanager
-import websocket
 
 history = []
 last_buy = None
@@ -14,66 +12,57 @@ active_connections = set()
 def get_wib_now():
     return (datetime.utcnow() + timedelta(hours=7)).strftime("%Y-%m-%d %H:%M:%S")
 
-def ws_thread():
+async def pusher_ws_loop():
+    import websockets
+
     global last_buy, history
-    def on_message(ws, message):
-        global last_buy, history
-        msg = json.loads(message)
-        if msg.get("event") == "gold-rate-event":
-            data = json.loads(msg["data"])
-            current_buy = float(data["buying_rate"].replace('.', ''))
-            status = "➖ Tetap"
-            if last_buy is not None:
-                if current_buy > last_buy:
-                    status = "🚀 Naik"
-                elif current_buy < last_buy:
-                    status = "🔻 Turun"
-            data["status"] = status
-            # Ganti waktu dengan waktu backend (WIB)
-            data["created_at"] = get_wib_now()
-            history.append(data)
-            history[:] = history[-88:]
-            last_buy = current_buy
-
-            # Broadcast ke semua client websocket
-            msg_out = json.dumps({"history": history[-88:]})
-            to_remove = set()
-            for ws_client in list(active_connections):
-                try:
-                    asyncio.run_coroutine_threadsafe(
-                        ws_client.send_text(msg_out),
-                        loop
-                    )
-                except Exception as e:
-                    print("Client error:", e)
-                    to_remove.add(ws_client)
-            for ws_client in to_remove:
-                active_connections.remove(ws_client)
-
-    def on_open(ws):
-        subscribe_msg = {
-            "event": "pusher:subscribe",
-            "data": {
-                "channel": "gold-rate"
-            }
-        }
-        ws.send(json.dumps(subscribe_msg))
-        print("Subscribed to gold-rate channel")
-
     ws_url = "wss://ws-ap1.pusher.com/app/52e99bd2c3c42e577e13?protocol=7&client=js&version=7.0.3&flash=false"
-    ws = websocket.WebSocketApp(
-        ws_url,
-        on_open=on_open,
-        on_message=on_message
-    )
-    ws.run_forever()
+    while True:
+        try:
+            async with websockets.connect(ws_url) as ws:
+                subscribe_msg = {
+                    "event": "pusher:subscribe",
+                    "data": {
+                        "channel": "gold-rate"
+                    }
+                }
+                await ws.send(json.dumps(subscribe_msg))
+                async for message in ws:
+                    msg = json.loads(message)
+                    if msg.get("event") == "gold-rate-event":
+                        data = json.loads(msg["data"])
+                        current_buy = float(data["buying_rate"].replace('.', ''))
+                        status = "➖ Tetap"
+                        if last_buy is not None:
+                            if current_buy > last_buy:
+                                status = "🚀 Naik"
+                            elif current_buy < last_buy:
+                                status = "🔻 Turun"
+                        data["status"] = status
+                        # Pakai waktu server, karena data pusher tidak ada timestamp
+                        data["created_at"] = get_wib_now()
+                        history.append(data)
+                        history[:] = history[-88:]
+                        last_buy = current_buy
+
+                        # Broadcast ke semua client websocket
+                        msg_out = json.dumps({"history": history[-88:]})
+                        to_remove = set()
+                        for ws_client in list(active_connections):
+                            try:
+                                await ws_client.send_text(msg_out)
+                            except Exception:
+                                to_remove.add(ws_client)
+                        for ws_client in to_remove:
+                            active_connections.remove(ws_client)
+        except Exception:
+            await asyncio.sleep(2)  # Reconnect delay 2 detik
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global loop
-    loop = asyncio.get_event_loop()
-    threading.Thread(target=ws_thread, daemon=True).start()
+    task = asyncio.create_task(pusher_ws_loop())
     yield
+    task.cancel()
 
 app = FastAPI(lifespan=lifespan)
 
@@ -83,7 +72,7 @@ async def index():
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Harga Emas Real-time</title>
+        <title>Harga Emas Real-time (2 Kolom, Waktu & Data)</title>
         <link rel="stylesheet" type="text/css" href="https://cdn.datatables.net/1.13.6/css/jquery.dataTables.min.css"/>
         <style>
             body { font-family: Arial; margin: 40px; }
@@ -117,7 +106,7 @@ async def index():
             new TradingView.widget({
                 "width": "100%",
                 "height": 400,
-                "symbol": "OANDA:XAUUSD", // Ganti sesuai pair yang kamu mau
+                "symbol": "OANDA:XAUUSD",
                 "interval": "15",
                 "timezone": "Asia/Jakarta",
                 "theme": "light",
@@ -130,6 +119,10 @@ async def index():
                 "container_id": "tradingview_chart"
             });
             </script>
+        </div>
+        <div style="margin-top:40px;">
+            <h3>Kalender Ekonomi</h3>
+            <iframe src="https://sslecal2.investing.com?columns=exc_flags,exc_currency,exc_importance,exc_actual,exc_forecast,exc_previous&category=_employment,_economicActivity,_inflation,_centralBanks,_confidenceIndex&importance=3&features=datepicker,timezone,timeselector,filters&countries=5,37,48,35,17,36,26,12,72&calType=week&timeZone=27&lang=54" width="650" height="467" frameborder="0" allowtransparency="true" marginwidth="0" marginheight="0"></iframe><div class="poweredBy" style="font-family: Arial, Helvetica, sans-serif;"><span style="font-size: 11px;color: #333333;text-decoration: none;">Kalender Ekonomi Real Time dipersembahkan oleh <a href="https://id.investing.com" rel="nofollow" target="_blank" style="font-size: 11px;color: #06529D; font-weight: bold;" class="underline_link">Investing.com Indonesia</a>.</span></div>        
         </div>
         <script src="https://code.jquery.com/jquery-3.7.0.min.js"></script>
         <script src="https://cdn.datatables.net/1.13.6/js/jquery.dataTables.min.js"></script>
