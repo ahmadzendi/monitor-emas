@@ -72,7 +72,7 @@ async def index():
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Harga Emas Real-time (2 Kolom, Waktu & Data)</title>
+        <title>Harga Emas</title>
         <link rel="stylesheet" type="text/css" href="https://cdn.datatables.net/1.13.6/css/jquery.dataTables.min.css"/>
         <style>
             body { font-family: Arial; margin: 40px; }
