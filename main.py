@@ -4,63 +4,83 @@ from datetime import datetime, timedelta
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from contextlib import asynccontextmanager
+import requests
 
 history = []
 last_buy = None
 active_connections = set()
 
-def get_wib_now():
-    return (datetime.utcnow() + timedelta(hours=7)).strftime("%Y-%m-%d %H:%M:%S")
+def format_rupiah(nominal):
+    try:
+        return "{:,}".format(int(nominal)).replace(",", ".")
+    except:
+        return str(nominal)
 
-async def pusher_ws_loop():
-    import websockets
-
+async def api_loop():
     global last_buy, history
-    ws_url = "wss://ws-ap1.pusher.com/app/52e99bd2c3c42e577e13?protocol=7&client=js&version=7.0.3&flash=false"
+    api_url = "https://api.treasury.id/api/v1/antigrvty/gold/rate"
+    shown_updates = set()
     while True:
         try:
-            async with websockets.connect(ws_url) as ws:
-                subscribe_msg = {
-                    "event": "pusher:subscribe",
-                    "data": {
-                        "channel": "gold-rate"
+            response = requests.post(api_url, timeout=10)
+            if response.ok:
+                data = response.json().get("data", {})
+                buying_rate = int(data.get("buying_rate", 0))
+                selling_rate = int(data.get("selling_rate", 0))
+                updated_at = data.get("updated_at")
+                if updated_at and updated_at not in shown_updates:
+                    # Status
+                    status = "➖ Tetap"
+                    if last_buy is not None:
+                        if buying_rate > last_buy:
+                            status = "🚀 Naik"
+                        elif buying_rate < last_buy:
+                            status = "🔻 Turun"
+                    # Simpan ke history
+                    row = {
+                        "buying_rate": buying_rate,
+                        "selling_rate": selling_rate,
+                        "status": status,
+                        "created_at": updated_at
                     }
-                }
-                await ws.send(json.dumps(subscribe_msg))
-                async for message in ws:
-                    msg = json.loads(message)
-                    if msg.get("event") == "gold-rate-event":
-                        data = json.loads(msg["data"])
-                        current_buy = float(data["buying_rate"].replace('.', ''))
-                        status = "➖ Tetap"
-                        if last_buy is not None:
-                            if current_buy > last_buy:
-                                status = "🚀 Naik"
-                            elif current_buy < last_buy:
-                                status = "🔻 Turun"
-                        data["status"] = status
-                        # Pakai waktu server, karena data pusher tidak ada timestamp
-                        data["created_at"] = get_wib_now()
-                        history.append(data)
-                        history[:] = history[-88:]
-                        last_buy = current_buy
-
-                        # Broadcast ke semua client websocket
-                        msg_out = json.dumps({"history": history[-88:]})
-                        to_remove = set()
-                        for ws_client in list(active_connections):
-                            try:
-                                await ws_client.send_text(msg_out)
-                            except Exception:
-                                to_remove.add(ws_client)
-                        for ws_client in to_remove:
-                            active_connections.remove(ws_client)
-        except Exception:
-            await asyncio.sleep(2)  # Reconnect delay 2 detik
+                    history.append(row)
+                    history[:] = history[-1441:]
+                    last_buy = buying_rate
+                    shown_updates.add(updated_at)
+                    # Broadcast ke semua client websocket
+                    # Kirim juga harga yang sudah diformat
+                    row_fmt = {
+                        "buying_rate": format_rupiah(buying_rate),
+                        "selling_rate": format_rupiah(selling_rate),
+                        "status": status,
+                        "created_at": updated_at
+                    }
+                    history_fmt = [
+                        {
+                            "buying_rate": format_rupiah(h["buying_rate"]),
+                            "selling_rate": format_rupiah(h["selling_rate"]),
+                            "status": h["status"],
+                            "created_at": h["created_at"]
+                        }
+                        for h in history
+                    ]
+                    msg_out = json.dumps({"history": history_fmt})
+                    to_remove = set()
+                    for ws_client in list(active_connections):
+                        try:
+                            await ws_client.send_text(msg_out)
+                        except Exception:
+                            to_remove.add(ws_client)
+                    for ws_client in to_remove:
+                        active_connections.remove(ws_client)
+            await asyncio.sleep(0.5)
+        except Exception as e:
+            print("Error:", e)
+            await asyncio.sleep(1)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    task = asyncio.create_task(pusher_ws_loop())
+    task = asyncio.create_task(api_loop())
     yield
     task.cancel()
 
@@ -72,7 +92,7 @@ async def index():
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Harga Emas</title>
+        <title>Harga Emas Treasury</title>
         <link rel="stylesheet" type="text/css" href="https://cdn.datatables.net/1.13.6/css/jquery.dataTables.min.css"/>
         <style>
             body { font-family: Arial; margin: 40px; }
@@ -143,7 +163,7 @@ async def index():
         <script>
             var table = $('#tabel').DataTable({
                 "pageLength": 4,
-                "lengthMenu": [4, 8, 18, 48, 88],
+                "lengthMenu": [4, 8, 18, 48, 88, 888, 1441],
                 "order": [],
                 "columns": [
                     { "data": "waktu" },
@@ -201,11 +221,26 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     active_connections.add(websocket)
     try:
-        await websocket.send_text(json.dumps({"history": history[-88:]}))
+        def format_rupiah(nominal):
+            try:
+                return "{:,}".format(int(nominal)).replace(",", ".")
+            except:
+                return str(nominal)
+        def format_history(hist):
+            return [
+                {
+                    "buying_rate": format_rupiah(h["buying_rate"]),
+                    "selling_rate": format_rupiah(h["selling_rate"]),
+                    "status": h["status"],
+                    "created_at": h["created_at"]
+                }
+                for h in hist
+            ]
+        await websocket.send_text(json.dumps({"history": format_history(history[-1441:])}))
         while True:
             await asyncio.sleep(30)
             await websocket.send_text(json.dumps({"ping": True}))
     except WebSocketDisconnect:
         pass
     finally:
-        active_connections.remove(websocket)
+        active_connections.discard(websocket)
